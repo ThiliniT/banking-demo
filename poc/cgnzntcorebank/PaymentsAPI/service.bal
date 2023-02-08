@@ -1,4 +1,8 @@
 import ballerina/http;
+import cgnzntpoc/cognizantcorebankbackend_no;
+
+
+
 
 //import ballerina/io;
 
@@ -20,7 +24,6 @@ service / on new http:Listener(9090) {
 
     # A resource for updating the accountBalance and maintaining transactions
     # + return - Status of transaction/History of Transactions
-
     resource function put creditAccount(float amount, string sourceOfPayment) returns string {
         // Send a response back to the caller.
         accountBalance += amount;
@@ -29,13 +32,22 @@ service / on new http:Listener(9090) {
         return "Transaction Successful";
 
     }
-    resource function put debitAccount(float amount, string sourceOfPayment) returns string {
+    resource function put debitAccount(float amount, string sourceOfPayment) returns string|error {
         // Send a response back to the caller.
+        cognizantcorebankbackend_no:Client endEp = check new (config = {
+            auth: {
+                clientId: "",
+                clientSecret: ""
+            }
+        });
+        json[] test = check endEp->/records.delete
+        
         accountBalance -= amount;
         transactionIndex += 1;
         allTransactions.add({indexNo: transactionIndex, amount: amount, sourceOfPayment: sourceOfPayment});
+
         return "Transaction Successful";
-        
+
     }
     resource function get transactions() returns json[] {
         // Send a response back to the caller.
