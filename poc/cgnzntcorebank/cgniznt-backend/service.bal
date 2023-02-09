@@ -2,8 +2,16 @@ import ballerina/http;
 import ballerina/uuid;
 import ballerina/time;
 import ballerina/log;
+import ballerinax/mysql.driver as _;
+import ballerinax/mysql;
+import ballerina/sql;
+import ballerina/io;
 
-int transactionIndex = 0;
+configurable string dbHost = ?;
+configurable string dbUser = ?;
+configurable string dbPassword = ?;
+configurable string dbName = ?;
+configurable int dbPort = ?;
 
 type Transactions record {|
 
@@ -21,6 +29,10 @@ type Transactions record {|
 
 table<Transactions> key(transactionId) allTransactions = table [
     ];
+
+mysql:Client dbClient = check new (
+    dbHost, dbUser, dbPassword, dbName, dbPort, connectionPool = {maxOpenConnections: 5}
+);
 
 type Accounts record {|
     readonly string accountId;
@@ -66,21 +78,31 @@ service / on new http:Listener(9090) {
             string accountType = check accountDetails.Data.Account.AccountType;
             string accountSubType = check accountDetails.Data.Account.AccountSubType;
             string accountNumber = uuid:createType4AsString();
-            json createdAccountDetails = {"AccountID": accountNumber, "Account Name": accountName, "Status": "Enabled", "StatusUpdateDateTime": time:utcToString(time:utcNow()), "Currency": currency, "AccountType": accountType, "AccountSubType": accountSubType, "Nickname": nickName, "OpeningDate": openingDate, "MaturityDate": maturityDate, "Balance": 0};
-            allAccounts.add({accountId: accountNumber, accountName: accountName, status: "Enabled", statusUpdateDateTime: time:utcToString(time:utcNow()), currency: currency, nickName: nickName, openingDate: openingDate, maturityDate: maturityDate, accountType: accountType, accountSubType: accountSubType, balance: 0});
-            json returnvalue = {
-                "Data": {
-                    "Account": [createdAccountDetails],
-                    "Meta": {
-                    },
-                    "Risk": {
-                    },
-                    "Links": {
-                        "Self": ""
+            string statusUpdateDateTime = time:utcToString(time:utcNow());
+            json createdAccountDetails = {"AccountID": accountNumber, "Account Name": accountName, "Status": "Enabled", "StatusUpdateDateTime": statusUpdateDateTime, "Currency": currency, "AccountType": accountType, "AccountSubType": accountSubType, "Nickname": nickName, "OpeningDate": openingDate, "MaturityDate": maturityDate, "Balance": 0};
+            //allAccounts.add({accountId: accountNumber, accountName: accountName, status: "Enabled", statusUpdateDateTime: time:utcToString(time:utcNow()), currency: currency, nickName: nickName, openingDate: openingDate, maturityDate: maturityDate, accountType: accountType, accountSubType: accountSubType, balance: 0});
+            sql:ParameterizedQuery accountQuery = `INSERT INTO cognizantbankaccounts (accountId, accountName, status, nickName, openingDate, maturityDate, currency, accountType, accountSubType, balance, statusUpdateDateTime ) VALUES (${accountNumber}, ${accountName}, "Enabled", ${nickName}, ${openingDate}, ${maturityDate}, ${currency}, ${accountType}, ${accountSubType}, 0, ${statusUpdateDateTime}  )`;
+            sql:ExecutionResult result = check dbClient->execute(accountQuery);
+
+            if (result.affectedRowCount == 1) {
+                json returnvalue = {
+                    "Data": {
+                        "Account": [createdAccountDetails],
+                        "Meta": {
+                        },
+                        "Risk": {
+                        },
+                        "Links": {
+                            "Self": ""
+                        }
                     }
-                }
-            };
-            return returnvalue;
+                };
+
+                return returnvalue;
+            } else {
+                return {"Message": "Failure in creating the account"};
+            }
+
         } on fail var e {
             string message = e.message();
             log:printError(message);
@@ -92,7 +114,7 @@ service / on new http:Listener(9090) {
     # A resource for creating new payment records
     # + paymentDetails - the payment resource
     # + return - payment information
-    resource function post payments(@http:Payload json paymentDetails) returns json|http:BadRequest {
+    resource function post payments(@http:Payload json paymentDetails) returns json|http:BadRequest|error {
         // Send a response back to the caller.
         do {
             // Send a response back to the caller.
@@ -104,11 +126,12 @@ service / on new http:Listener(9090) {
             string valueDateTime = time:utcToString(time:utcNow());
             float amount = check float:fromString(amountTemp);
             string[] accountId_issuer = check self.setAccount(paymentDetails, amount);
+
             string issuer = accountId_issuer[0];
             string accountId = accountId_issuer[1];
-            transactionIndex += 1;
+
             float accountBalance = check self.getAccountBal(accountId);
-            return self.setCredit(accountId, transactionIndex, reference, amount, creditDebitIndicator, bookingDateTime, valueDateTime, issuer, accountBalance, currency);
+            return self.setCredit(accountId, reference, amount, creditDebitIndicator, bookingDateTime, valueDateTime, issuer, accountBalance, currency);
         } on fail var e {
             string message = e.message();
             log:printError(message);
@@ -120,12 +143,21 @@ service / on new http:Listener(9090) {
     # A resource for returning transaction records
     # + return - transaction history
     #
-    resource function get transactions() returns json {
+    resource function get transactions() returns json|error {
         // Send a response back to the caller.
-        json[] transactionsHistory = <json[]>allTransactions.toJson();
+
+        sql:ParameterizedQuery transactionsQuery = `SELECT * FROM cognizantbanktransactions;`;
+        stream<Transactions, sql:Error?> transactionsStream = dbClient->query(transactionsQuery);
+        allTransactions.removeAll();
+        check from Transactions trsctn in transactionsStream
+            do {
+                allTransactions.add(trsctn);
+
+            };
+
         return {
             "Data": {
-                "Transaction": [transactionsHistory]
+                "Transaction": [allTransactions.toJson()]
             }
         };
 
@@ -144,9 +176,22 @@ service / on new http:Listener(9090) {
     #
     resource function get accounts() returns json|error {
         // Send a response back to the caller.
-        json[] listOfAccounts = <json[]>allAccounts.toJson();
-        json returnData = {"Data": {"Account": listOfAccounts}};
-        return returnData;
+
+        sql:ParameterizedQuery accountsQuery = `SELECT * FROM cognizantbankaccounts;`;
+        stream<Accounts, sql:Error?> accountsStream = dbClient->query(accountsQuery);
+        allAccounts.removeAll();
+        check from Accounts acnts in accountsStream
+            do {
+                allAccounts.add(acnts);
+
+            };
+
+        return {
+            "Data": {
+                "Account": [allAccounts.toJson()]
+            }
+        };
+
     }
 
     private function setAccount(json details, float amount) returns string[]|error
@@ -158,86 +203,107 @@ service / on new http:Listener(9090) {
         {
             issuer = check details.Data.Initiation.DebtorAccount.SchemeName;
             accountId = check details.Data.Initiation.CreditorAccount.Identification;
-            self.changeAccountBalance(amount, accountId, "Credit");
+            io:println(amount, accountId);
+            error? changeAccountBalanceResult = self.changeAccountBalance(amount, accountId, "Credit");
 
         }
         else {
             issuer = check details.Data.Initiation.CreditorAccount.SchemeName;
             accountId = check details.Data.Initiation.DebtorAccount.Identification;
-            self.changeAccountBalance(amount, accountId, "Debit");
+            error? changeAccountBalanceResult = self.changeAccountBalance(amount, accountId, "Debit");
 
         }
         return [issuer, accountId];
 
     }
 
-    private function changeAccountBalance(float amount, string accountId, string typeofTrans)
+    private function changeAccountBalance(float amount, string accountId, string typeofTrans) returns error?
     {
-        foreach Accounts ac in allAccounts {
-            if (ac.accountId == accountId && typeofTrans == "Credit")
-            {
-                ac.balance += amount;
-            }
-            if (ac.accountId == accountId && typeofTrans == "Debit")
-            {
-                ac.balance -= amount;
-            }
 
-        }
+        sql:ParameterizedQuery accountQuery = `SELECT * FROM cognizantbankaccounts WHERE accountId = ${accountId};`;
+        stream<Accounts, sql:Error?> accountsStream = dbClient->query(accountQuery);
+        float updatedBalance = 0;
+        check from Accounts acct in accountsStream
+            do {
+                if (acct.accountId == accountId && typeofTrans == "Credit")
+                {
+                    updatedBalance = acct.balance + amount;
+                }
+                if (acct.accountId == accountId && typeofTrans == "Debit")
+                {
+                    updatedBalance = acct.balance - amount;
+                }
+
+            };
+        sql:Error?? close = accountsStream.close();
+        sql:ParameterizedQuery updatequery = `UPDATE cognizantbankaccounts SET balance = ${updatedBalance} WHERE accountId = ${accountId}`;
+        sql:ExecutionResult result = check dbClient->execute(updatequery);
+
     }
 
     private function getAccountBal(string accountId) returns float|error
     {
-        foreach Accounts ac in allAccounts {
-            if (ac.accountId == accountId)
-            {
-                return ac.balance;
-            }
 
-        }
+        io:println("getacoun called  ", accountId);
+        sql:ParameterizedQuery accountQuery = `SELECT balance FROM cognizantbankaccounts WHERE accountId = ${accountId};`;
+        float|sql:Error balance = dbClient->queryRow(accountQuery);
 
-        return 0;
+        return balance;
     }
 
-    private function setCredit(string accountId, int transactionId, string transactionReference,
+    private function setCredit(string accountId, string transactionReference,
             float amount,
             string creditDebitIndicator,
             string bookingDateTime,
             string valueDateTime,
             string issuer,
             float balance,
-            string currency) returns json {
+            string currency) returns json|http:BadRequest {
 
-        allTransactions.add({accountId: accountId, transactionId: transactionIndex, transactionReference: transactionReference, amount: amount, creditDebitIndicator: creditDebitIndicator, bookingDateTime: bookingDateTime, valueDateTime: valueDateTime, issuer: issuer, balance: balance, currency: currency});
-        json transactionSummary = {
-            "Data": {
-                "Status": "InitiationCompleted",
-                "StatusUpdateDateTime": bookingDateTime,
-                "CreationDateTime": valueDateTime,
-                "Initiation": {
-                    "Issuer": issuer
+        //allTransactions.add({accountId: accountId, transactionId: transactionIndex, transactionReference: transactionReference, amount: amount, creditDebitIndicator: creditDebitIndicator, bookingDateTime: bookingDateTime, valueDateTime: valueDateTime, issuer: issuer, balance: balance, currency: currency});
+        sql:ParameterizedQuery transactionQuery = `INSERT INTO cognizantbanktransactions (accountId, transactionReference, amount, creditDebitIndicator, bookingDateTime, valueDateTime, issuer, balance, currency ) VALUES (${accountId},  ${transactionReference}, ${amount}, ${creditDebitIndicator} , ${bookingDateTime}, ${valueDateTime}, ${issuer}, ${balance}, ${currency} )`;
+        do {
+
+            sql:ExecutionResult result = check dbClient->execute(transactionQuery);
+
+            json transactionSummary = {
+                "Data": {
+                    "Status": "InitiationCompleted",
+                    "StatusUpdateDateTime": bookingDateTime,
+                    "CreationDateTime": valueDateTime,
+                    "Initiation": {
+                        "Issuer": issuer
+                    },
+                    "Reference": transactionReference,
+                    "Amount": {
+                        "Amount": amount,
+                        "Currency": currency
+                    }
                 },
-                "Reference": transactionReference,
-                "Amount": {
-                    "Amount": amount,
-                    "Currency": currency
-                }
-            },
-            "Meta": {
+                "Meta": {
 
-            },
-            "Links": {
-                "Self": ""
-            }
-        };
-        return transactionSummary;
+                },
+                "Links": {
+                    "Self": ""
+                }
+            };
+
+            return transactionSummary;
+        } on fail var e {
+            string message = e.message();
+            log:printError(message);
+            return http:BAD_REQUEST;
+        }
 
     }
+
     # A resource for deleting accounts and transactions
-    resource function delete records() {
-        allTransactions.removeAll();
-        allAccounts.removeAll();
+    resource function delete records() returns error? {
+
+        sql:ParameterizedQuery query = `Delete from cognizantbankaccounts`;
+        sql:ExecutionResult result = check dbClient->execute(query);
+        query = `Delete from cognizantbanktransactions`;
+        result = check dbClient->execute(query);
 
     }
 }
-
