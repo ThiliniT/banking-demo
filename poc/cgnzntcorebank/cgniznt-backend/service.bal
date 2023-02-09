@@ -18,12 +18,12 @@ type Transactions record {|
     string accountId;
     readonly int transactionId;
     string transactionReference;
-    float amount;
+    decimal amount;
     string creditDebitIndicator;
     string bookingDateTime;
     string valueDateTime;
     string issuer;
-    float balance;
+    decimal balance;
     string currency;
 |};
 
@@ -33,6 +33,8 @@ table<Transactions> key(transactionId) allTransactions = table [
 mysql:Client dbClient = check new (
     dbHost, dbUser, dbPassword, dbName, dbPort, connectionPool = {maxOpenConnections: 5}
 );
+
+
 
 type Accounts record {|
     readonly string accountId;
@@ -45,7 +47,7 @@ type Accounts record {|
     string maturityDate;
     string accountType;
     string accountSubType;
-    float balance;
+    decimal balance;
 
 |};
 
@@ -53,7 +55,7 @@ table<Accounts> key(accountId) allAccounts = table [
     ];
 
 type AmountRec record {|
-    float amount;
+    decimal amount;
     string currency;
 |};
 
@@ -79,8 +81,8 @@ service / on new http:Listener(9090) {
             string accountSubType = check accountDetails.Data.Account.AccountSubType;
             string accountNumber = uuid:createType4AsString();
             string statusUpdateDateTime = time:utcToString(time:utcNow());
-            json createdAccountDetails = {"AccountID": accountNumber, "Account Name": accountName, "Status": "Enabled", "StatusUpdateDateTime": statusUpdateDateTime, "Currency": currency, "AccountType": accountType, "AccountSubType": accountSubType, "Nickname": nickName, "OpeningDate": openingDate, "MaturityDate": maturityDate, "Balance": 0};
-            //allAccounts.add({accountId: accountNumber, accountName: accountName, status: "Enabled", statusUpdateDateTime: time:utcToString(time:utcNow()), currency: currency, nickName: nickName, openingDate: openingDate, maturityDate: maturityDate, accountType: accountType, accountSubType: accountSubType, balance: 0});
+            json createdAccountDetails = {"AccountID": accountNumber, "Account Name": accountName, "Status": "Enabled", "StatusUpdateDateTime": statusUpdateDateTime, "Currency": currency, "AccountType": accountType, "AccountSubType": accountSubType, "Nickname": nickName, "OpeningDate": openingDate, "MaturityDate": maturityDate, "Balance": 0.0};
+            //allAccounts.add({accountId: accountNumber, accountName: accountName, status: "Enabled", statusUpdateDateTime: time:utcToString(time:utcNow()), currency: currency, nickName: nickName, openingDate: openingDate, maturityDate: maturityDate, accountType: accountType, accountSubType: accountSubType, balance: 0.0});
             sql:ParameterizedQuery accountQuery = `INSERT INTO cognizantbankaccounts (accountId, accountName, status, nickName, openingDate, maturityDate, currency, accountType, accountSubType, balance, statusUpdateDateTime ) VALUES (${accountNumber}, ${accountName}, "Enabled", ${nickName}, ${openingDate}, ${maturityDate}, ${currency}, ${accountType}, ${accountSubType}, 0, ${statusUpdateDateTime}  )`;
             sql:ExecutionResult result = check dbClient->execute(accountQuery);
 
@@ -124,13 +126,17 @@ service / on new http:Listener(9090) {
             string currency = check paymentDetails.Data.Initiation.Amount.Currency;
             string bookingDateTime = time:utcToString(time:utcNow());
             string valueDateTime = time:utcToString(time:utcNow());
-            float amount = check float:fromString(amountTemp);
+            decimal amount = check decimal:fromString(amountTemp);
             string[] accountId_issuer = check self.setAccount(paymentDetails, amount);
 
             string issuer = accountId_issuer[0];
             string accountId = accountId_issuer[1];
 
-            float accountBalance = check self.getAccountBal(accountId);
+            decimal accountBalance = check self.getAccountBal(accountId);
+            if(creditDebitIndicator=="Debit" && (<int>accountBalance==0||accountBalance<amount) )
+            {
+                return {"message":"Insufficient Balance"};
+            }
             return self.setCredit(accountId, reference, amount, creditDebitIndicator, bookingDateTime, valueDateTime, issuer, accountBalance, currency);
         } on fail var e {
             string message = e.message();
@@ -194,7 +200,7 @@ service / on new http:Listener(9090) {
 
     }
 
-    private function setAccount(json details, float amount) returns string[]|error
+    private function setAccount(json details, decimal amount) returns string[]|error
     {
         string creditDebitIndicator = check details.Data.Initiation.CreditDebitIndicator;
         string issuer = "";
@@ -217,12 +223,12 @@ service / on new http:Listener(9090) {
 
     }
 
-    private function changeAccountBalance(float amount, string accountId, string typeofTrans) returns error?
+    private function changeAccountBalance(decimal amount, string accountId, string typeofTrans) returns error?
     {
 
         sql:ParameterizedQuery accountQuery = `SELECT * FROM cognizantbankaccounts WHERE accountId = ${accountId};`;
         stream<Accounts, sql:Error?> accountsStream = dbClient->query(accountQuery);
-        float updatedBalance = 0;
+        decimal updatedBalance = 0.0;
         check from Accounts acct in accountsStream
             do {
                 if (acct.accountId == accountId && typeofTrans == "Credit")
@@ -232,35 +238,45 @@ service / on new http:Listener(9090) {
                 if (acct.accountId == accountId && typeofTrans == "Debit")
                 {
                     updatedBalance = acct.balance - amount;
+                    if (<float>updatedBalance < 0.0)
+                    {
+                        updatedBalance = 0;
+                    }
                 }
 
             };
-        sql:Error?? close = accountsStream.close();
-        sql:ParameterizedQuery updatequery = `UPDATE cognizantbankaccounts SET balance = ${updatedBalance} WHERE accountId = ${accountId}`;
-        sql:ExecutionResult result = check dbClient->execute(updatequery);
+            sql:Error?? close = accountsStream.close();
+        if (<float>updatedBalance >= 0.0)
+        {
+            sql:ParameterizedQuery updatequery = `UPDATE cognizantbankaccounts SET balance = ${updatedBalance} WHERE accountId = ${accountId}`;
+            sql:ExecutionResult result = check dbClient->execute(updatequery);
+        }
 
     }
 
-    private function getAccountBal(string accountId) returns float|error
+    private function getAccountBal(string accountId) returns decimal|error
     {
 
         io:println("getacoun called  ", accountId);
         sql:ParameterizedQuery accountQuery = `SELECT balance FROM cognizantbankaccounts WHERE accountId = ${accountId};`;
-        float|sql:Error balance = dbClient->queryRow(accountQuery);
+        decimal balance = check dbClient->queryRow(accountQuery);
 
+        io:println(balance);
         return balance;
     }
 
     private function setCredit(string accountId, string transactionReference,
-            float amount,
+            decimal amount,
             string creditDebitIndicator,
             string bookingDateTime,
             string valueDateTime,
             string issuer,
-            float balance,
+            decimal balance,
             string currency) returns json|http:BadRequest {
 
         //allTransactions.add({accountId: accountId, transactionId: transactionIndex, transactionReference: transactionReference, amount: amount, creditDebitIndicator: creditDebitIndicator, bookingDateTime: bookingDateTime, valueDateTime: valueDateTime, issuer: issuer, balance: balance, currency: currency});
+
+        io:println(amount, balance);
         sql:ParameterizedQuery transactionQuery = `INSERT INTO cognizantbanktransactions (accountId, transactionReference, amount, creditDebitIndicator, bookingDateTime, valueDateTime, issuer, balance, currency ) VALUES (${accountId},  ${transactionReference}, ${amount}, ${creditDebitIndicator} , ${bookingDateTime}, ${valueDateTime}, ${issuer}, ${balance}, ${currency} )`;
         do {
 
