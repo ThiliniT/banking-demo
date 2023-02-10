@@ -256,6 +256,10 @@ service / on new http:Listener(9090) {
 
     }
 
+
+    # A resource for deleting transactions history and reset accounts
+  
+
     resource function delete records() returns error? {
 
         sql:ParameterizedQuery query = `Delete from fundingbanktransactions`;
